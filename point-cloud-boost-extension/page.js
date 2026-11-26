@@ -14,6 +14,16 @@
   let panelMade = false;
   let projectionButton = null;
   let statusElement = null;
+  let countElement = null;
+  let measureElement = null;
+  let lastCuboidCount = -1;
+  let lastTotalCount = -1;
+  let totalCuboidCount = 0;
+  const ORIGIN_SHAPE = { id: 'origin', points: [0, 0, 0, 0, 0, 0, 0, 0, 0] };
+  let measureRef = 'origin';
+
+  let measureTarget = null;
+  let lastMeasureText = '';
   try {
     calibration = JSON.parse(localStorage.getItem(KEY_CALIB)) || {};
   } catch (_) {
@@ -60,9 +70,13 @@
     }
     input[type=range] { width: 100%; min-width: 0; margin: 0; }
     .val { min-width: 34px; text-align: right; }
-    .tools { grid-column: 1 / -1; display: flex; gap: 6px; }
+    .tools { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; }
     .tools button { width: auto; height: 18px; padding: 0 5px; font-size: 11px; line-height: 18px; }
     .status { grid-column: 1 / -1; font-size: 11px; opacity: .75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .count { grid-column: 1 / -1; font-weight: 600; }
+    .count b { color: #4fc3f7; }
+    .measure { grid-column: 1 / -1; font-size: 11px; line-height: 1.35; white-space: pre-line; }
+    .measure b { color: #ffd54f; }
     .box.min .row { display: none; }
   `;
 
@@ -134,6 +148,16 @@
     tools.append(loadButton, projectionButton);
     box.appendChild(tools);
 
+    countElement = document.createElement('div');
+    countElement.className = 'count row';
+    box.appendChild(countElement);
+    refreshCount();
+
+    measureElement = document.createElement('div');
+    measureElement.className = 'measure row';
+    box.appendChild(measureElement);
+    refreshMeasure();
+
     statusElement = document.createElement('div');
     statusElement.className = 'status row';
     box.appendChild(statusElement);
@@ -182,6 +206,7 @@
       folderInput.value = '';
     });
     tools.appendChild(folderButton);
+
     root.append(fileInput, folderInput);
 
     const place = (x, y) => {
@@ -375,10 +400,7 @@
           const state = store.getState();
           const annotations = state && state.annotation && state.annotation.annotations;
           const id = annotations ? annotations.activatedStateID : null;
-          if (id !== selectedClientID) {
-            selectedClientID = id;
-            lastOverlaySignature = '';
-          }
+          if (id !== selectedClientID) handleSelection(id);
         };
         readSelection();
         return {
@@ -397,8 +419,7 @@
     if (!canvas || selectionCanvas === canvas) return;
     selectionCanvas = canvas;
     canvas.addEventListener('canvas.selected', (event) => {
-      selectedClientID = event.detail ? event.detail.clientID : null;
-      lastOverlaySignature = '';
+      handleSelection(event.detail ? event.detail.clientID : null);
     });
   }
 
@@ -441,6 +462,61 @@
       });
     }
     return cubes;
+  }
+
+  function refreshCount() {
+    if (!countElement) return;
+    const count = annotationCache.filter((shape) => shape.id !== 'drawTemplate').length;
+    if (count === lastCuboidCount && totalCuboidCount === lastTotalCount) return;
+    lastCuboidCount = count;
+    lastTotalCount = totalCuboidCount;
+    countElement.textContent = `Cuboids: ${count} frame · ${totalCuboidCount} total`;
+  }
+
+  function handleSelection(id) {
+    selectedClientID = id;
+    measureTarget = (id === null || id === undefined) ? null : id;
+    lastOverlaySignature = '';
+    refreshMeasure();
+  }
+
+  function supportRadius(points, direction) {
+    const yaw = Number(points[5]) || 0;
+    const c = Math.cos(yaw), s = Math.sin(yaw);
+    const halfLength = Math.abs(Number(points[6]) || 0) / 2;
+    const halfWidth = Math.abs(Number(points[7]) || 0) / 2;
+    const halfHeight = Math.abs(Number(points[8]) || 0) / 2;
+    return Math.abs(direction[0] * c + direction[1] * s) * halfLength +
+      Math.abs(-direction[0] * s + direction[1] * c) * halfWidth +
+      Math.abs(direction[2]) * halfHeight;
+  }
+
+  function refreshMeasure() {
+    if (!measureElement) return;
+    const a = ORIGIN_SHAPE;
+    const b = (selectedClientID !== null && selectedClientID !== undefined)
+      ? annotationCache.find((shape) => String(shape.id) === String(selectedClientID))
+      : null;
+    measureTarget = b ? b.id : null;
+    let text;
+    if (b) {
+      const dx = Number(b.points[0]);
+      const dy = Number(b.points[1]);
+      const dz = Number(b.points[2]);
+      const d3 = Math.hypot(dx, dy, dz);
+      const bev = Math.hypot(dx, dy);
+      const direction = d3 ? [dx / d3, dy / d3, dz / d3] : [1, 0, 0];
+      const gap = d3 - supportRadius(b.points, direction);
+      const gapText = gap >= 0 ? `${gap.toFixed(2)} m` : `overlap ${(-gap).toFixed(2)} m`;
+      text = `Measure origin → #${b.id}\n` +
+        `Center ${d3.toFixed(2)} m · BEV ${bev.toFixed(2)} m\n` +
+        `Surface gap ${gapText}`;
+    } else {
+      text = 'Measure origin → click a cuboid';
+    }
+    if (text === lastMeasureText) return;
+    lastMeasureText = text;
+    measureElement.textContent = text;
   }
 
   function refreshStatus() {
@@ -583,7 +659,7 @@
     return seen && inside ? pieces : [];
   }
 
-  async function fetchAnnotations(frame, now, force) {
+  async function fetchAnnotations(frame, now, force, useForCache) {
     const jobId = getJobId();
     if (!jobId || fetching) return;
     if (!force && now - lastFetchAt < 700) return;
@@ -608,7 +684,16 @@
             shapes.push(Object.assign({}, best, { label_id: track.label_id, id: track.id }));
           }
         });
-        annotationCache = shapes;
+        if (useForCache) annotationCache = shapes;
+        const ids = new Set();
+        (data.shapes || []).forEach((shape) => {
+          if (shape.type === 'cuboid') ids.add(`s:${shape.id}`);
+        });
+        (data.tracks || []).forEach((track) => {
+          if ((track.shapes || []).some((shape) => shape.type === 'cuboid')) ids.add(`t:${track.id}`);
+        });
+        totalCuboidCount = ids.size;
+        refreshCount();
       }
     } catch (_) {
       // Keep the last successful annotations on transient API errors.
@@ -672,6 +757,7 @@
     const cams = calibration[currentSequence()];
     const signature = [
       projectionOn ? '1' : '0', selectedClientID === null ? '-' : selectedClientID,
+      measureRef === null ? '-' : measureRef, measureTarget === null ? '-' : measureTarget,
       calibrationVersion, currentSequence(), lastFrameFetched,
       annotationCache.map((shape) => `${shape.id}:${shape.label_id}:${shape.color || ''}:${(shape.points || []).join(',')}`).join('|'),
       canvases.map((canvas) => {
@@ -696,10 +782,11 @@
       const ih = canvas.height || 1020;
       const scale = rect.width && rect.height ? Math.min(rect.width / iw, rect.height / ih) : 0;
       const width = iw * scale, height = ih * scale;
-      const shapes = projectionOn ? annotationCache : annotationCache.filter((shape) => (
-        selectedClientID !== null && selectedClientID !== undefined &&
-        String(shape.id) === String(selectedClientID)
-      ));
+      const shapes = projectionOn ? annotationCache : annotationCache.filter((shape) => {
+        const id = String(shape.id);
+        if (measureTarget !== null && (id === String(measureRef) || id === String(measureTarget))) return true;
+        return selectedClientID !== null && selectedClientID !== undefined && id === String(selectedClientID);
+      });
       const visible = !!cams && !!scale && shapes.length > 0 && isCanvasOnTop(canvas, rect);
       svg.style.display = visible ? 'block' : 'none';
       svg.style.left = rect.left - wrapperRect.left + (rect.width - width) / 2 + 'px';
@@ -713,7 +800,9 @@
       const cam = cams[name] || cams[Object.keys(cams).find((key) => key.toLowerCase() === name.toLowerCase())];
       if (!cam) return;
       shapes.forEach((shape) => {
-        const color = shape.color || PALETTE[(Math.max(1, Number(shape.label_id) || 1) - 1) % PALETTE.length];
+        let color = shape.color || PALETTE[(Math.max(1, Number(shape.label_id) || 1) - 1) % PALETTE.length];
+        if (measureTarget !== null && String(shape.id) === String(measureRef)) color = '#ffd54f';
+        if (measureTarget !== null && String(shape.id) === String(measureTarget)) color = '#4fc3f7';
         projectBox(shape.points, cam).forEach((piece) => {
           const line = document.createElementNS(SVG_NS, 'polyline');
           line.setAttribute('points', piece.map(([u, v]) => `${u.toFixed(1)},${v.toFixed(1)}`).join(' '));
@@ -738,12 +827,15 @@
         const live = liveCuboids(frame);
         if (live !== null) {
           annotationCache = live;
+          fetchAnnotations(frame, now, false, false);
         } else {
           const force = frame !== lastFrameFetched;
           if (force) lastFrameFetched = frame;
-          fetchAnnotations(frame, now, force);
+          fetchAnnotations(frame, now, force, true);
         }
       }
+      refreshCount();
+      refreshMeasure();
       const seq = currentSequence();
       if (seq !== lastSequence) {
         lastSequence = seq;
